@@ -5,6 +5,8 @@
 #   Development: docker build --target development -t agor:dev -f docker/Dockerfile .
 #   Production:  docker build --target production -t agor:prod -f docker/Dockerfile .
 #
+# Optional second stage (full repo on devbase): COPY --chown=agor:agor . /app — avoid RUN chown -R /app (slow).
+#
 # Or use docker-compose which automatically selects the right target
 
 # ============================================================================
@@ -98,8 +100,9 @@ RUN mkdir -p /home/agor/.config/zellij && \
     chown -R agor_executor:agor_executor /home/agor_executor/.config && \
     rm /tmp/zellij-config.kdl
 
-# Set working directory
+# Set working directory (must be writable by agor for pnpm; avoid slow `chown -R /app` later)
 WORKDIR /app
+RUN chown agor:agor /app
 
 # Switch to agor user
 USER agor
@@ -109,27 +112,28 @@ USER agor
 # ============================================================================
 FROM base AS development
 
-# Copy package files for dependency installation (as root, then chown)
-COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
-COPY apps/agor-daemon/package.json ./apps/agor-daemon/
-COPY apps/agor-cli/package.json ./apps/agor-cli/
-COPY apps/agor-ui/package.json ./apps/agor-ui/
-COPY packages/core/package.json ./packages/core/
-COPY packages/executor/package.json ./packages/executor/
+# Copy package files with ownership so we avoid slow `chown -R /app`
+COPY --chown=agor:agor package.json pnpm-lock.yaml pnpm-workspace.yaml ./
+COPY --chown=agor:agor apps/agor-daemon/package.json ./apps/agor-daemon/
+COPY --chown=agor:agor apps/agor-cli/package.json ./apps/agor-cli/
+COPY --chown=agor:agor apps/agor-ui/package.json ./apps/agor-ui/
+COPY --chown=agor:agor packages/core/package.json ./packages/core/
+COPY --chown=agor:agor packages/executor/package.json ./packages/executor/
 
 # Install dependencies as agor user (cached in Docker layer)
 # This creates node_modules with correct platform binaries for container
 # An anonymous volume at /app/node_modules shadows the bind mount, preserving these deps
-RUN sudo chown -R agor:agor /app && \
-    pnpm install --frozen-lockfile
+RUN pnpm install --frozen-lockfile
+
+# Include full source tree for non-bind-mounted environments (e.g. Kubernetes).
+# Without this, runtime build commands in the entrypoint can't find /app/packages/* sources.
+COPY --chown=agor:agor . /app
 
 # Copy entrypoint scripts
-COPY docker/docker-entrypoint.sh /usr/local/bin/
-COPY docker/docker-entrypoint-postgres.sh /usr/local/bin/
-RUN sudo chmod +x /usr/local/bin/docker-entrypoint.sh && \
-    sudo chmod +x /usr/local/bin/docker-entrypoint-postgres.sh && \
-    sudo chown agor:agor /usr/local/bin/docker-entrypoint.sh && \
-    sudo chown agor:agor /usr/local/bin/docker-entrypoint-postgres.sh
+COPY --chown=agor:agor docker/docker-entrypoint.sh /usr/local/bin/
+COPY --chown=agor:agor docker/docker-entrypoint-postgres.sh /usr/local/bin/
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh && \
+    chmod +x /usr/local/bin/docker-entrypoint-postgres.sh
 
 # Expose UI port only (daemon is internal)
 EXPOSE ${VITE_PORT:-5173}
@@ -153,9 +157,8 @@ RUN npm install -g agor-live@latest
 USER agor
 
 # Copy production entrypoint script
-COPY docker/docker-entrypoint-prod.sh /usr/local/bin/
-RUN sudo chmod +x /usr/local/bin/docker-entrypoint-prod.sh && \
-    sudo chown agor:agor /usr/local/bin/docker-entrypoint-prod.sh
+COPY --chown=agor:agor docker/docker-entrypoint-prod.sh /usr/local/bin/
+RUN chmod +x /usr/local/bin/docker-entrypoint-prod.sh
 
 # Expose daemon port (UI will be served via static files by daemon)
 EXPOSE ${DAEMON_PORT:-3030}

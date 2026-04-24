@@ -64,7 +64,7 @@ echo "🔨 Building @agor/executor (initial build)..."
 pnpm --filter @agor/executor build
 
 echo "⏳ Waiting for @agor/executor type definitions..."
-MAX_WAIT=30
+MAX_WAIT=120
 WAITED=0
 while [ ! -f "/app/packages/executor/dist/index.d.ts" ]; do
   if [ $WAITED -ge $MAX_WAIT ]; then

@@ -742,6 +742,9 @@ importers:
       diff:
         specifier: ^7.0.0
         version: 7.0.0
+      undici:
+        specifier: '>=7.18.2'
+        version: 7.21.0
       zod:
         specifier: ^4.3.6
         version: 4.3.6
