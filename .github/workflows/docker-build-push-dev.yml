@@ -1,0 +1,47 @@
+name: Build and Push Agor Dev Image
+
+on:
+  push:
+    branches:
+      - dev
+  workflow_dispatch:
+
+env:
+  PROJECT_ID: infra-producto
+  REGISTRY: us-central1-docker.pkg.dev
+  REPOSITORY: portal-registry
+  IMAGE_NAME: agor-dev
+  IMAGE_TAG: k8s
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Google Auth
+        id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Configure Docker for Artifact Registry
+        run: gcloud auth configure-docker ${{ env.REGISTRY }}
+
+      - name: Build and push development Docker image
+        run: |
+          docker build \
+            --target development \
+            -t ${{ env.REGISTRY }}/${{ env.PROJECT_ID }}/${{ env.REPOSITORY }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }} \
+            -f docker/Dockerfile \
+            .
+          docker push ${{ env.REGISTRY }}/${{ env.PROJECT_ID }}/${{ env.REPOSITORY }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
