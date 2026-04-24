@@ -25,20 +25,25 @@
 
 import type { Database } from '@agor/core/db';
 import {
+  generateId,
+  MessagesRepository,
   SessionMCPServerRepository,
   SessionRepository,
+  TaskRepository,
   UsersRepository,
   WorktreeRepository,
 } from '@agor/core/db';
 import type {
   MCPServerID,
+  Message,
   PermissionMode,
   Session,
   SessionID,
+  Task,
   User,
   Worktree,
 } from '@agor/core/types';
-import { SessionStatus } from '@agor/core/types';
+import { MessageRole, SessionStatus, TaskStatus } from '@agor/core/types';
 import type { UnixUserMode } from '@agor/core/unix';
 import { getNextRunTime, getPrevRunTime } from '@agor/core/utils/cron';
 import Handlebars from 'handlebars';
@@ -53,6 +58,10 @@ export interface SchedulerConfig {
   debug?: boolean;
   /** Unix user mode for validation (default: 'simple') */
   unixUserMode?: UnixUserMode;
+  /** Prompt dispatch verification timeout in milliseconds (default: 15000) */
+  dispatchVerificationTimeoutMs?: number;
+  /** Prompt dispatch verification poll interval in milliseconds (default: 1000) */
+  dispatchVerificationPollMs?: number;
 }
 
 export class SchedulerService {
@@ -62,6 +71,8 @@ export class SchedulerService {
   private isRunning = false;
   private worktreeRepo: WorktreeRepository;
   private sessionRepo: SessionRepository;
+  private taskRepo: TaskRepository;
+  private messageRepo: MessagesRepository;
   private userRepo: UsersRepository;
   private sessionMCPRepo: SessionMCPServerRepository;
 
@@ -72,11 +83,168 @@ export class SchedulerService {
       gracePeriod: config.gracePeriod ?? 120000, // 2 minutes
       debug: config.debug ?? false,
       unixUserMode: config.unixUserMode ?? 'simple',
+      dispatchVerificationTimeoutMs: config.dispatchVerificationTimeoutMs ?? 15000,
+      dispatchVerificationPollMs: config.dispatchVerificationPollMs ?? 1000,
     };
     this.worktreeRepo = new WorktreeRepository(db);
     this.sessionRepo = new SessionRepository(db);
+    this.taskRepo = new TaskRepository(db);
+    this.messageRepo = new MessagesRepository(db);
     this.userRepo = new UsersRepository(db);
     this.sessionMCPRepo = new SessionMCPServerRepository(db);
+  }
+
+  private shortId(id: string): string {
+    return id.substring(0, 8);
+  }
+
+  private async sleep(ms: number): Promise<void> {
+    await new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  private hasTaskExecutionProgress(task: Task): boolean {
+    if (task.status !== TaskStatus.RUNNING) {
+      return true;
+    }
+    if (
+      task.message_range?.start_index !== undefined ||
+      task.message_range?.start_timestamp !== undefined
+    ) {
+      return true;
+    }
+    if ((task.tool_use_count ?? 0) > 0) {
+      return true;
+    }
+    return false;
+  }
+
+  private async verifyPromptDispatch(
+    sessionId: string,
+    taskId: string
+  ): Promise<{ ok: true } | { ok: false; reason: string }> {
+    const startedAt = Date.now();
+    const timeoutAt = startedAt + this.config.dispatchVerificationTimeoutMs;
+
+    while (Date.now() < timeoutAt) {
+      const session = await this.sessionRepo.findById(sessionId);
+      if (!session) {
+        return { ok: false, reason: 'Session disappeared during dispatch verification' };
+      }
+
+      if (session.sdk_session_id) {
+        return { ok: true };
+      }
+
+      const sessionMessages = await this.messageRepo.findBySessionId(sessionId as SessionID);
+      const hasNonQueuedMessage = sessionMessages.some((msg) => msg.status !== 'queued');
+      if (hasNonQueuedMessage) {
+        return { ok: true };
+      }
+
+      const task = await this.taskRepo.findById(taskId);
+      if (task && this.hasTaskExecutionProgress(task)) {
+        return { ok: true };
+      }
+
+      await this.sleep(this.config.dispatchVerificationPollMs);
+    }
+
+    return {
+      ok: false,
+      reason: `No executor progress observed within ${this.config.dispatchVerificationTimeoutMs}ms`,
+    };
+  }
+
+  private async addSchedulerSystemMessage(
+    sessionId: string,
+    taskId: string | undefined,
+    content: string
+  ): Promise<void> {
+    try {
+      const messagesService = this.app.service('messages');
+      const message: Partial<Message> = {
+        message_id: generateId() as Message['message_id'],
+        session_id: sessionId as Message['session_id'],
+        task_id: taskId as Message['task_id'] | undefined,
+        type: 'system',
+        role: MessageRole.SYSTEM,
+        content,
+        content_preview: 'Scheduler dispatch failed',
+        index: await this.sessionRepo.countMessages(sessionId),
+        timestamp: new Date().toISOString(),
+      };
+      await messagesService.create(message, { provider: undefined });
+    } catch (error) {
+      console.warn(
+        `⚠️  Failed to create scheduler system message for session ${this.shortId(sessionId)}:`,
+        error instanceof Error ? error.message : String(error)
+      );
+    }
+  }
+
+  private async failScheduledDispatch(
+    worktree: Worktree,
+    sessionId: string,
+    taskId: string | undefined,
+    scheduledRunAt: number,
+    reason: string
+  ): Promise<void> {
+    const sessionsService = this.app.service('sessions');
+    const tasksService = this.app.service('tasks');
+    const payload = {
+      session_id: sessionId,
+      worktree_id: worktree.worktree_id,
+      scheduled_run_at: new Date(scheduledRunAt).toISOString(),
+      reason,
+    };
+
+    console.error('❌ [Scheduler dispatch failed]', payload);
+
+    try {
+      const task = taskId ? await this.taskRepo.findById(taskId) : null;
+      const isTaskActive =
+        !!task &&
+        (task.status === TaskStatus.RUNNING ||
+          task.status === 'awaiting_permission' ||
+          task.status === 'awaiting_input' ||
+          task.status === 'stopping' ||
+          task.status === 'timed_out');
+      if (isTaskActive) {
+        await tasksService.patch(taskId!, {
+          status: TaskStatus.FAILED,
+          completed_at: new Date().toISOString(),
+        });
+      }
+    } catch (error) {
+      console.warn(
+        `⚠️  Failed to mark scheduled task ${taskId ? this.shortId(taskId) : 'unknown'} as failed:`,
+        error instanceof Error ? error.message : String(error)
+      );
+    }
+
+    try {
+      await sessionsService.patch(
+        sessionId,
+        {
+          status: SessionStatus.IDLE,
+          ready_for_prompt: true,
+        },
+        { provider: undefined }
+      );
+    } catch (error) {
+      console.warn(
+        `⚠️  Failed to reset session ${this.shortId(sessionId)} to idle after dispatch failure:`,
+        error instanceof Error ? error.message : String(error)
+      );
+    }
+
+    await this.addSchedulerSystemMessage(
+      sessionId,
+      taskId,
+      `Scheduler dispatch timeout: the scheduled run did not start correctly and was auto-recovered.\n` +
+        `Reason: ${reason}\n` +
+        `You can retry this run manually from the session.`
+    );
   }
 
   /**
@@ -370,7 +538,10 @@ export class SchedulerService {
       // But still need to bypass auth - use the service with no params
       const sessionsService = this.app.service('sessions');
       const createdSession = await sessionsService.create(session);
-      console.log(`      ✅ Spawned scheduled session for ${worktree.name} (run #${runIndex})`);
+      const shortSessionId = this.shortId(createdSession.session_id);
+      console.log(
+        `      ✅ [Scheduler] due->session_created session=${shortSessionId} worktree=${this.shortId(worktree.worktree_id)} scheduled_run_at=${new Date(scheduledRunAt).toISOString()} run=${runIndex}`
+      );
 
       // 6. Attach MCP servers BEFORE triggering prompt (so agent has tools from the start)
       // Precedence: schedule config (if defined) > worktree defaults
@@ -408,6 +579,9 @@ export class SchedulerService {
       // Without the user, the token defaults to 'anonymous' which doesn't exist in the database,
       // causing the executor to fail with "User not found: anonymous" error.
       const promptService = this.app.service('/sessions/:id/prompt');
+      console.log(
+        `      🔄 [Scheduler] prompt_trigger session=${shortSessionId} scheduled_run_at=${new Date(scheduledRunAt).toISOString()}`
+      );
       await promptService.create(
         {
           prompt: renderedPrompt,
@@ -421,10 +595,43 @@ export class SchedulerService {
         } as import('@agor/core/types').AuthenticatedParams & { route: { id: string } }
       );
 
-      // 7. Update schedule metadata
+      // 8. Explicitly verify scheduler->executor handoff completed.
+      const latestSession = await sessionsService.get(createdSession.session_id, {
+        provider: undefined,
+      });
+      const latestTaskId = (latestSession.tasks ?? [])[latestSession.tasks.length - 1];
+      if (latestTaskId) {
+        const verification = await this.verifyPromptDispatch(
+          createdSession.session_id,
+          latestTaskId
+        );
+        if (!verification.ok) {
+          await this.failScheduledDispatch(
+            worktree,
+            createdSession.session_id,
+            latestTaskId,
+            scheduledRunAt,
+            verification.reason
+          );
+        } else {
+          console.log(
+            `      ✅ [Scheduler] dispatch_verified session=${shortSessionId} scheduled_run_at=${new Date(scheduledRunAt).toISOString()}`
+          );
+        }
+      } else {
+        await this.failScheduledDispatch(
+          worktree,
+          createdSession.session_id,
+          undefined,
+          scheduledRunAt,
+          'No task ID found on scheduled prompt trigger'
+        );
+      }
+
+      // 9. Update schedule metadata
       await this.updateScheduleMetadata(worktree, scheduledRunAt, now);
 
-      // 8. Enforce retention policy
+      // 10. Enforce retention policy
       await this.enforceRetentionPolicy(worktree);
     } catch (error) {
       console.error(`      ❌ Failed to spawn session for ${worktree.name}:`, error);
