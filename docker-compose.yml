@@ -102,6 +102,7 @@ services:
       - NODE_ENV=development
       - DAEMON_PORT=${DAEMON_PORT:-3030}
       - CORS_ORIGIN=${CORS_ORIGIN:-*}
+      - NODE_OPTIONS=--max-old-space-size=4096
 
       # UI configuration
       - UI_PORT=${UI_PORT:-5173}
@@ -131,10 +132,15 @@ services:
       # Instance identification (optional - displayed in UI navbar)
       - INSTANCE_LABEL=${INSTANCE_LABEL:-}
 
+      # OpenCode server URL (internal Docker network - avoids SSE timeout issues)
+      - OPENCODE_SERVER_URL=http://opencode:4096
+
     depends_on:
       postgres:
         condition: service_healthy
         required: false # Optional dependency - only needed when postgres profile is active
+      opencode:
+        condition: service_healthy
     volumes:
       # Mount entire repo for hot-reload (source code only)
       - .:/app
@@ -152,9 +158,63 @@ services:
       # Persist entire home directory (database, config, agent auth tokens, etc.)
       - agor-home:/home/agor
       # Mount SSH keys for git authentication (dev only)
-      - ~/.ssh:/home/agor/.ssh:ro
+      - ~/.ssh:/home/agor/.ssh
     stdin_open: true
     tty: true
+
+  # OpenCode AI coding agent server
+  # Runs inside Docker to avoid SSE stream timeouts across network boundaries
+  # Agor connects to it via internal Docker network at http://opencode:4096
+  opencode:
+    image: node:22
+    command: >
+      bash -c "
+        if [ ! -f /root/.opencode/bin/opencode ]; then
+          echo 'Installing opencode...' &&
+          curl -fsSL https://opencode.ai/install | bash;
+        fi &&
+        chown root:root /root/.ssh/config 2>/dev/null || true &&
+        chmod 600 /root/.ssh/config 2>/dev/null || true &&
+        ssh-keyscan github.com >> /root/.ssh/known_hosts 2>/dev/null || true &&
+        echo 'Starting OpenCode server on port 4096...' &&
+        /root/.opencode/bin/opencode serve --port 4096 --hostname 0.0.0.0
+      "
+    ports:
+      - '4096:4096'
+    volumes:
+      - opencode-home:/root
+      - agor-home:/home/agor
+      - ~/.ssh:/root/.ssh
+    environment:
+      - GOOGLE_API_KEY=${GOOGLE_API_KEY:-}
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:4096/session').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 120s
+    restart: unless-stopped
+
+  # Jira MCP Server
+  # Provides Jira integration so agents can read ticket descriptions, comments, etc.
+  # Agor connects to it as an MCP server at http://jira-mcp:9000/sse
+  # Setup: add your Jira credentials to .env file
+  jira-mcp:
+    image: mcp/atlassian
+    ports:
+      - '9000:9000'
+    environment:
+      # Your Jira Cloud instance URL
+      - JIRA_URL=${JIRA_URL:-https://jira-datakimia.atlassian.net}
+      # Your Atlassian account email
+      - JIRA_USERNAME=${JIRA_USERNAME:-}
+      # Atlassian API token - generate at:
+      # https://id.atlassian.com/manage-profile/security/api-tokens
+      - JIRA_API_TOKEN=${JIRA_API_TOKEN:-}
+      # Transport mode for remote MCP access
+      - TRANSPORT=sse
+      - PORT=9000
+    restart: unless-stopped
 
   # PostgreSQL database (ONLY active with --profile postgres)
   # Usage: docker-compose --profile postgres up
@@ -194,6 +254,11 @@ volumes:
   # - Agent auth tokens
   # - Caches, etc.
   agor-home:
+
+  # OpenCode persistent storage
+  # Stores: npm global packages (opencode-ai), auth tokens, config
+  # First startup installs opencode-ai (~1-2 min), subsequent starts are instant
+  opencode-home:
 
   # PostgreSQL data (only created when postgres profile is active)
   postgres-data:

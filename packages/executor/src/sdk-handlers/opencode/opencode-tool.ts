@@ -86,6 +86,23 @@ export class OpenCodeTool implements ITool {
   private sessionMCPRepo?: SessionMCPServerRepository;
   private mcpServerRepo?: MCPServerRepository;
 
+  private getApiError(response: unknown): unknown | undefined {
+    if (!response || typeof response !== 'object' || !('error' in response)) {
+      return undefined;
+    }
+
+    const errorValue = (response as { error?: unknown }).error;
+    return errorValue == null ? undefined : errorValue;
+  }
+
+  private getApiData<T>(response: unknown): T | undefined {
+    if (!response || typeof response !== 'object' || !('data' in response)) {
+      return undefined;
+    }
+
+    return (response as { data?: T }).data;
+  }
+
   constructor(
     config: OpenCodeConfig,
     messagesService?: MessagesService,
@@ -325,12 +342,18 @@ export class OpenCodeTool implements ITool {
         query: config.workingDirectory ? { directory: config.workingDirectory } : undefined,
       });
 
-      if (response.error) {
-        throw new Error(`OpenCode API error: ${JSON.stringify(response.error)}`);
+      const apiError = this.getApiError(response);
+      if (apiError) {
+        throw new Error(`OpenCode API error: ${JSON.stringify(apiError)}`);
+      }
+
+      const responseData = this.getApiData<{ id?: string }>(response);
+      if (!responseData?.id) {
+        throw new Error('OpenCode API error: missing session id in createSession response');
       }
 
       return {
-        sessionId: response.data.id,
+        sessionId: responseData.id,
         toolType: 'opencode',
       };
     } catch (error) {
@@ -463,6 +486,7 @@ export class OpenCodeTool implements ITool {
       // Process events as they arrive
       let _responseCompleted = false;
       let assistantMessageId: string | undefined;
+      const assistantMessageIds = new Set<string>();
       const metadata: {
         messageId?: string;
         parentMessageId?: string;
@@ -526,6 +550,7 @@ export class OpenCodeTool implements ITool {
               event.properties.info.sessionID === context.opencodeSessionId &&
               event.properties.info.role === 'assistant'
             ) {
+              assistantMessageIds.add(event.properties.info.id);
               if (!assistantMessageId) {
                 assistantMessageId = event.properties.info.id;
                 console.log('[OpenCodeTool] Assistant message identified:', assistantMessageId);
@@ -544,7 +569,7 @@ export class OpenCodeTool implements ITool {
               const part = event.properties.part;
 
               // Skip if this part is not from the assistant message
-              if (!assistantMessageId || part.messageID !== assistantMessageId) {
+              if (!assistantMessageIds.has(part.messageID)) {
                 console.log(
                   '[OpenCodeTool] Skipping part from non-assistant message:',
                   part.messageID
@@ -650,21 +675,30 @@ export class OpenCodeTool implements ITool {
       console.log('[OpenCodeTool] Waiting for prompt response...');
       const response = await promptPromise;
 
-      if (response.error) {
-        throw new Error(`OpenCode API error: ${JSON.stringify(response.error)}`);
+      const apiError = this.getApiError(response);
+      if (apiError) {
+        throw new Error(`OpenCode API error: ${JSON.stringify(apiError)}`);
+      }
+
+      const responseData = this.getApiData<{
+        parts?: OpenCodePart[];
+        info?: unknown;
+      }>(response);
+      if (!responseData) {
+        throw new Error('OpenCode API error: missing response data');
       }
 
       console.log('[OpenCodeTool] ========== FINAL RESPONSE ==========');
-      console.log('[OpenCodeTool] Response data:', JSON.stringify(response.data, null, 2));
+      console.log('[OpenCodeTool] Response data:', JSON.stringify(responseData, null, 2));
       console.log('[OpenCodeTool] ===================================');
 
       // Check for error in response
       let hasError = false;
       let errorMessage = '';
-      const responseInfo = response.data.info as
-        | (typeof response.data.info & {
+      const responseInfo = (responseData.info ?? undefined) as
+        | {
             error?: { data?: { message?: string }; message?: string };
-          })
+          }
         | undefined;
       if (responseInfo?.error) {
         const errorInfo = responseInfo.error;
@@ -706,10 +740,14 @@ export class OpenCodeTool implements ITool {
         responseText = `❌ **OpenCode Error**\n\n${errorMessage}`;
       } else {
         // Only extract text from parts if no error occurred
-        for (const part of response.data.parts || []) {
+        for (const part of responseData.parts || []) {
           // Collect text from reasoning and text parts
           // TextPart and ReasoningPart both have a .text property
-          if (part.type === 'reasoning' || part.type === 'text') {
+          if (
+            (part.type === 'reasoning' || part.type === 'text') &&
+            'text' in part &&
+            typeof part.text === 'string'
+          ) {
             textParts.push(part.text);
           }
 
@@ -755,7 +793,7 @@ export class OpenCodeTool implements ITool {
 
       // Process parts from final response (not from streaming cache)
       // The final response contains ALL parts, including ones that weren't streamed
-      const finalParts = response.data.parts || [];
+      const finalParts = responseData.parts || [];
       console.log(
         '[OpenCodeTool] Building message content from',
         finalParts.length,
@@ -896,14 +934,26 @@ export class OpenCodeTool implements ITool {
   ): Promise<TaskResult> {
     const response = await client.session.prompt(promptOptions);
 
-    if (response.error) {
-      throw new Error(`OpenCode API error: ${JSON.stringify(response.error)}`);
+    const apiError = this.getApiError(response);
+    if (apiError) {
+      throw new Error(`OpenCode API error: ${JSON.stringify(apiError)}`);
     }
 
-    console.log('[OpenCodeTool] Response received, parts count:', response.data.parts?.length || 0);
+    const responseData = this.getApiData<{
+      parts?: OpenCodePart[];
+      info?: {
+        id?: string;
+        parentID?: string;
+      };
+    }>(response);
+    if (!responseData) {
+      throw new Error('OpenCode API error: missing response data');
+    }
+
+    console.log('[OpenCodeTool] Response received, parts count:', responseData.parts?.length || 0);
     console.log(
       '[OpenCodeTool] Part types:',
-      response.data.parts?.map((p) => p.type).join(', ') || 'none'
+      responseData.parts?.map((p) => p.type).join(', ') || 'none'
     );
 
     // Extract text and metadata from response
@@ -921,22 +971,26 @@ export class OpenCodeTool implements ITool {
     } = {};
 
     // Extract metadata from 'info' field
-    if (response.data.info) {
-      if (response.data.info.id) {
-        metadata.messageId = response.data.info.id;
+    if (responseData.info) {
+      if (responseData.info.id) {
+        metadata.messageId = responseData.info.id;
       }
-      if (response.data.info.parentID) {
-        metadata.parentMessageId = response.data.info.parentID;
+      if (responseData.info.parentID) {
+        metadata.parentMessageId = responseData.info.parentID;
       }
     }
 
     // Extract text and token/cost metadata from 'parts' array
-    if (response.data.parts && Array.isArray(response.data.parts)) {
+    if (responseData.parts && Array.isArray(responseData.parts)) {
       // Extract text from all parts that have text content (text, reasoning, etc.)
       const textParts: string[] = [];
-      for (const part of response.data.parts) {
+      for (const part of responseData.parts) {
         // TextPart and ReasoningPart both have a .text property
-        if (part.type === 'text' || part.type === 'reasoning') {
+        if (
+          (part.type === 'text' || part.type === 'reasoning') &&
+          'text' in part &&
+          typeof part.text === 'string'
+        ) {
           textParts.push(part.text);
         }
       }
@@ -944,7 +998,7 @@ export class OpenCodeTool implements ITool {
       console.log('[OpenCodeTool] Extracted', textParts.length, 'text parts');
 
       // Extract metadata from step-finish part
-      const stepFinish = response.data.parts.find((part) => part.type === 'step-finish');
+      const stepFinish = responseData.parts.find((part) => part.type === 'step-finish');
       if (stepFinish && stepFinish.type === 'step-finish') {
         metadata.cost = stepFinish.cost;
         metadata.tokens = {
@@ -1022,16 +1076,24 @@ export class OpenCodeTool implements ITool {
         path: { id: sessionId },
       });
 
-      if (response.error) {
-        throw new Error(`OpenCode API error: ${JSON.stringify(response.error)}`);
+      const apiError = this.getApiError(response);
+      if (apiError) {
+        throw new Error(`OpenCode API error: ${JSON.stringify(apiError)}`);
+      }
+
+      const responseData = this.getApiData<{
+        time?: { created?: string; updated?: string };
+      }>(response);
+      if (!responseData?.time?.created || !responseData.time.updated) {
+        throw new Error('OpenCode API error: missing session timestamps');
       }
 
       return {
         sessionId,
         toolType: 'opencode' as const,
         status: 'active',
-        createdAt: new Date(response.data.time.created),
-        lastUpdatedAt: new Date(response.data.time.updated),
+        createdAt: new Date(responseData.time.created),
+        lastUpdatedAt: new Date(responseData.time.updated),
       };
     } catch (error) {
       throw new Error(
@@ -1053,8 +1115,9 @@ export class OpenCodeTool implements ITool {
         path: { id: sessionId },
       });
 
-      if (response.error) {
-        console.error('Failed to get messages:', response.error);
+      const apiError = this.getApiError(response);
+      if (apiError) {
+        console.error('Failed to get messages:', apiError);
         return [];
       }
 
@@ -1075,11 +1138,16 @@ export class OpenCodeTool implements ITool {
     try {
       const response = await client.session.list();
 
-      if (response.error) {
-        throw new Error(`OpenCode API error: ${JSON.stringify(response.error)}`);
+      const apiError = this.getApiError(response);
+      if (apiError) {
+        throw new Error(`OpenCode API error: ${JSON.stringify(apiError)}`);
       }
 
-      const sessions = Array.isArray(response.data) ? response.data : [];
+      const responseData =
+        this.getApiData<Array<{ id: string; time: { created: string; updated: string } }>>(
+          response
+        );
+      const sessions = Array.isArray(responseData) ? responseData : [];
 
       return sessions.map((session) => ({
         sessionId: session.id,

@@ -780,9 +780,11 @@ export default class Init extends Command {
     await setConfigValue('daemon.allowAnonymous', false);
     this.log(`${chalk.green('   ✓')} Enabled authentication`);
 
-    // Set OpenCode server URL (Docker-specific)
+    // OpenCode URL: prefer OPENCODE_SERVER_URL (k8s / compose) so --set-config stops clobbering UI with host.docker.internal
     await setConfigValue('opencode.enabled', true);
-    await setConfigValue('opencode.serverUrl', 'http://host.docker.internal:4096');
-    this.log(`${chalk.green('   ✓')} Configured OpenCode server`);
+    const opencodeServerUrl =
+      process.env.OPENCODE_SERVER_URL?.trim() || 'http://host.docker.internal:4096';
+    await setConfigValue('opencode.serverUrl', opencodeServerUrl);
+    this.log(`${chalk.green('   ✓')} Configured OpenCode server (${opencodeServerUrl})`);
   }
 }

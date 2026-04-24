@@ -599,9 +599,11 @@ async function main() {
     config.daemon.instanceLabel = process.env.INSTANCE_LABEL;
   }
 
-  // Configure daemon URL for executor payloads (used by all services)
-  // Uses config.daemon.public_url if set (for k8s), otherwise defaults to localhost
-  const daemonUrl = config.daemon?.public_url || `http://localhost:${DAEMON_PORT}`;
+  // Configure daemon URL for executor payloads (used by all services).
+  // DAEMON_URL env wins (k8s / split containers): OpenCode runs in another pod and must reach MCP via cluster DNS.
+  // Otherwise config.daemon.public_url, then localhost (single-process dev).
+  const daemonUrl =
+    process.env.DAEMON_URL || config.daemon?.public_url || `http://localhost:${DAEMON_PORT}`;
   configureDaemonUrl(daemonUrl);
   console.log(`[Executor] Daemon URL configured: ${daemonUrl}`);
 
@@ -1071,92 +1073,91 @@ async function main() {
         console.error(`[Executor ${sessionId.slice(0, 8)}] ${data.toString().trim()}`);
       });
 
-      executorProcess.on('exit', async (code) => {
-        console.log(`[Executor ${sessionId.slice(0, 8)}] Exited with code ${code}`);
-
-        // Clean up PID tracking
-        executorProcesses.delete(sessionId);
-
-        // Safety net: When executor exits, check if the task is still running.
-        // If so, mark it as FAILED via TasksService.patch() — this triggers the standard
-        // completion flow (session → IDLE, parent callbacks, queue processing).
-        // Only fall back to manual session IDLE update if the task patch fails.
+      let terminationHandled = false;
+      let tokenRevoked = false;
+      const revokeTokenOnce = () => {
+        if (tokenRevoked) return;
+        tokenRevoked = true;
+        appWithExecutor.sessionTokenService?.revokeToken(sessionToken);
+      };
+      const handleExecutorTermination = async (reason: string) => {
+        if (terminationHandled) {
+          return;
+        }
+        terminationHandled = true;
         try {
-          // CRITICAL: Check if THIS task is still the current/latest task before updating
-          // If a new task has started while this executor was exiting, we must NOT
-          // set the session to IDLE - that would break the running task.
           const currentSession = await app.service('sessions').get(sessionId, params);
           const latestTaskId = currentSession.tasks?.[currentSession.tasks.length - 1];
-
           if (latestTaskId && latestTaskId !== taskId) {
             console.log(
-              `⏭️ [Executor] Task ${taskId.slice(0, 8)} is not the latest (latest: ${latestTaskId.slice(0, 8)}), skipping safety net`
+              `⏭️ [Executor] Task ${taskId.slice(0, 8)} is not latest (latest: ${latestTaskId.slice(0, 8)}), skipping ${reason}`
             );
-            // Skip the update - a newer task owns the session state
-          } else if (
+            return;
+          }
+
+          const isSessionActive =
             currentSession.status === SessionStatus.RUNNING ||
             currentSession.status === SessionStatus.AWAITING_PERMISSION ||
             currentSession.status === SessionStatus.AWAITING_INPUT ||
             currentSession.status === SessionStatus.STOPPING ||
-            currentSession.status === SessionStatus.TIMED_OUT
-          ) {
-            // Session is still in an active/waiting state but executor is gone.
-            // Mark the task as FAILED — TasksService.patch() handles:
-            // - Setting session to IDLE + ready_for_prompt
-            // - Queuing parent callbacks (for subsessions)
-            // - Triggering queue processing
-            try {
-              const currentTask = await app.service('tasks').get(taskId, params);
-              const isTaskStillActive =
-                currentTask.status === TaskStatus.RUNNING ||
-                currentTask.status === 'awaiting_permission' ||
-                currentTask.status === 'awaiting_input' ||
-                currentTask.status === 'stopping' ||
-                currentTask.status === 'timed_out';
+            currentSession.status === SessionStatus.TIMED_OUT;
+          if (!isSessionActive) {
+            console.log(
+              `ℹ️  [Executor] Session ${sessionId.slice(0, 8)} already ${currentSession.status}, skipping ${reason}`
+            );
+            return;
+          }
 
-              if (isTaskStillActive) {
-                await app.service('tasks').patch(taskId, { status: TaskStatus.FAILED }, params);
-                console.log(
-                  `✅ [Executor] Task ${taskId.slice(0, 8)} marked as FAILED after executor exit (code: ${code})`
-                );
-              } else {
-                // Task already terminal but session still active — repair session state
-                console.log(
-                  `⚠️  [Executor] Task ${taskId.slice(0, 8)} already ${currentTask.status}, but session still ${currentSession.status} — repairing session state`
-                );
-                await app
-                  .service('sessions')
-                  .patch(sessionId, { status: SessionStatus.IDLE, ready_for_prompt: true }, params);
-              }
-            } catch (taskError) {
-              // Task patch failed — fall back to direct session IDLE update
-              console.error(
-                `⚠️  [Executor] Failed to mark task ${taskId.slice(0, 8)} as FAILED, falling back to session IDLE update:`,
-                taskError
-              );
-              await app.service('sessions').patch(
-                sessionId,
-                {
-                  status: SessionStatus.IDLE,
-                  ready_for_prompt: true,
-                },
-                params
-              );
+          try {
+            const currentTask = await app.service('tasks').get(taskId, params);
+            const isTaskStillActive =
+              currentTask.status === TaskStatus.RUNNING ||
+              currentTask.status === 'awaiting_permission' ||
+              currentTask.status === 'awaiting_input' ||
+              currentTask.status === 'stopping' ||
+              currentTask.status === 'timed_out';
+            if (isTaskStillActive) {
+              await app.service('tasks').patch(taskId, { status: TaskStatus.FAILED }, params);
               console.log(
-                `✅ [Executor] Session ${sessionId.slice(0, 8)} status updated to IDLE after executor exit (was: ${currentSession.status})`
+                `✅ [Executor] Task ${taskId.slice(0, 8)} marked FAILED after ${reason}; session recovered`
+              );
+            } else {
+              await app
+                .service('sessions')
+                .patch(sessionId, { status: SessionStatus.IDLE, ready_for_prompt: true }, params);
+              console.log(
+                `✅ [Executor] Session ${sessionId.slice(0, 8)} reset to IDLE after ${reason} (task already ${currentTask.status})`
               );
             }
-          } else {
-            console.log(
-              `ℹ️  [Executor] Session ${sessionId.slice(0, 8)} already in ${currentSession.status} state, skipping IDLE update`
+          } catch (taskError) {
+            console.error(
+              `⚠️  [Executor] Failed task recovery after ${reason}, forcing session reset:`,
+              taskError
             );
+            await app
+              .service('sessions')
+              .patch(sessionId, { status: SessionStatus.IDLE, ready_for_prompt: true }, params);
           }
         } catch (error) {
-          console.error(`❌ [Executor] Failed to handle executor exit:`, error);
+          console.error(`❌ [Executor] Failed to handle ${reason}:`, error);
+        } finally {
+          revokeTokenOnce();
         }
+      };
 
-        // Revoke session token after executor exits
-        appWithExecutor.sessionTokenService?.revokeToken(sessionToken);
+      executorProcess.on('error', async (error) => {
+        console.error(
+          `[Executor ${sessionId.slice(0, 8)}] Spawn/runtime error:`,
+          error instanceof Error ? error.message : String(error)
+        );
+        executorProcesses.delete(sessionId);
+        await handleExecutorTermination('executor process error');
+      });
+
+      executorProcess.on('exit', async (code) => {
+        console.log(`[Executor ${sessionId.slice(0, 8)}] Exited with code ${code}`);
+        executorProcesses.delete(sessionId);
+        await handleExecutorTermination(`executor exit (code=${code})`);
       });
 
       return {
@@ -7079,7 +7080,7 @@ async function main() {
           throw new Error('OpenCode is not enabled in configuration');
         }
 
-        const serverUrl = opencodeConfig.serverUrl || 'http://localhost:4096';
+        const serverUrl = (opencodeConfig.serverUrl || 'http://localhost:4096').replace(/\/$/, '');
         console.log('[OpenCode] Fetching models from server:', serverUrl);
 
         // Fetch from /config/providers which returns only configured providers
@@ -7144,11 +7145,11 @@ async function main() {
     async find(params?: any) {
       try {
         // Use serverUrl from query params if provided, otherwise fall back to saved config
-        let serverUrl: string;
+        let configuredServerUrl: string;
 
         if (params?.query?.serverUrl) {
           // Test with the provided serverUrl (from frontend, not yet saved)
-          serverUrl = params.query.serverUrl;
+          configuredServerUrl = params.query.serverUrl;
         } else {
           // Fall back to saved config
           const freshConfig = await loadConfig();
@@ -7156,8 +7157,10 @@ async function main() {
           if (!opencodeConfig?.enabled) {
             throw new Error('OpenCode is not enabled in configuration');
           }
-          serverUrl = opencodeConfig.serverUrl || 'http://localhost:4096';
+          configuredServerUrl = opencodeConfig.serverUrl || 'http://localhost:4096';
         }
+
+        const serverUrl = configuredServerUrl.replace(/\/$/, '');
 
         // OpenCode doesn't have a /health endpoint - use /config as a lightweight test
         const response = await fetch(`${serverUrl}/config`);
@@ -7353,6 +7356,100 @@ async function main() {
   schedulerService.start();
   console.log(`🔄 Scheduler started (tick interval: 30s)`);
 
+  // Periodic self-healing for stale sessions/tasks that never made progress after dispatch.
+  // This catches silent handoff failures that happen after startup cleanup.
+  const staleSessionSweepIntervalMs = Number(
+    process.env.AGOR_STALE_SESSION_SWEEP_INTERVAL_MS ?? 60_000
+  );
+  const staleSessionThresholdMs = Number(process.env.AGOR_STALE_SESSION_THRESHOLD_MS ?? 300_000);
+  const staleMessageRepo = new MessagesRepository(db);
+  const staleTaskRepo = new TaskRepository(db);
+  let staleSweepRunning = false;
+  const staleSessionSweepHandle = setInterval(async () => {
+    if (staleSweepRunning) return;
+    staleSweepRunning = true;
+    try {
+      const runningSessionsResult = (await sessionsService.find({
+        query: { status: SessionStatus.RUNNING, $limit: 1000 },
+      })) as unknown as Paginated<Session>;
+      for (const session of runningSessionsResult.data) {
+        const sessionAgeMs =
+          Date.now() - new Date(session.last_updated || session.created_at).getTime();
+        if (sessionAgeMs < staleSessionThresholdMs) continue;
+        if (session.sdk_session_id) continue;
+        if (executorProcesses.has(session.session_id)) continue;
+
+        const allMessages = await staleMessageRepo.findBySessionId(session.session_id as SessionID);
+        const nonQueuedMessages = allMessages.filter((m) => m.status !== 'queued');
+        if (nonQueuedMessages.length > 0) continue;
+
+        const latestTaskId = session.tasks?.[session.tasks.length - 1];
+        if (!latestTaskId) continue;
+        const latestTask = await staleTaskRepo.findById(latestTaskId);
+        if (!latestTask) continue;
+        const taskAgeMs =
+          Date.now() -
+          new Date(latestTask.started_at || latestTask.created_at || session.created_at).getTime();
+        if (taskAgeMs < staleSessionThresholdMs) continue;
+        const isLatestTaskActive =
+          latestTask.status === TaskStatus.RUNNING ||
+          latestTask.status === 'awaiting_permission' ||
+          latestTask.status === 'awaiting_input' ||
+          latestTask.status === 'stopping' ||
+          latestTask.status === 'timed_out';
+        if (!isLatestTaskActive) continue;
+
+        const shortSessionId = session.session_id.substring(0, 8);
+        const reason =
+          `Stale scheduler dispatch recovery (no sdk_session_id, no non-queued messages, ` +
+          `no tracked executor for >${Math.round(staleSessionThresholdMs / 1000)}s)`;
+        console.error(
+          `❌ [StaleDispatchSweeper] Recovering stale session ${shortSessionId}: ${reason}`
+        );
+
+        await app.service('tasks').patch(
+          latestTask.task_id,
+          {
+            status: TaskStatus.FAILED,
+            completed_at: new Date().toISOString(),
+          },
+          {}
+        );
+        await app.service('sessions').patch(
+          session.session_id,
+          {
+            status: SessionStatus.IDLE,
+            ready_for_prompt: true,
+          },
+          {}
+        );
+
+        const systemMessage: Partial<Message> = {
+          message_id: generateId() as Message['message_id'],
+          session_id: session.session_id as Message['session_id'],
+          task_id: latestTask.task_id as Message['task_id'],
+          type: 'system',
+          role: 'system' as Message['role'],
+          content:
+            `Automatic recovery: scheduled/session dispatch appears stalled and was reset.\n` +
+            `Reason: ${reason}\n` +
+            `The task was marked failed and the session is ready for retry.`,
+          content_preview: 'Stale dispatch auto-recovery',
+          index: await sessionsRepository.countMessages(session.session_id),
+          timestamp: new Date().toISOString(),
+        };
+        await messagesService.create(systemMessage);
+      }
+    } catch (error) {
+      console.error('❌ [StaleDispatchSweeper] Sweep failed:', error);
+    } finally {
+      staleSweepRunning = false;
+    }
+  }, staleSessionSweepIntervalMs);
+  console.log(
+    `🩺 Stale dispatch sweeper started (interval: ${Math.round(staleSessionSweepIntervalMs / 1000)}s, threshold: ${Math.round(staleSessionThresholdMs / 1000)}s)`
+  );
+
   // Initialize gateway: refresh channel state cache, then start Socket Mode listeners
   const gatewayService = app.service('gateway') as unknown as GatewayService;
   gatewayService
@@ -7383,6 +7480,7 @@ async function main() {
       // Stop scheduler
       console.log('🔄 Stopping scheduler...');
       schedulerService.stop();
+      clearInterval(staleSessionSweepHandle);
 
       // Close Socket.io connections (this also closes the HTTP server)
       const socketServer = socketIOConfig.getSocketServer();

@@ -1,3 +1,5 @@
 services:
   agor-dev:
-    user: '${UID:-1000}:${GID:-1000}'
+    environment:
+      - NODE_OPTIONS=--max-old-space-size=4096
+      - UNDICI_TIMEOUT=0
