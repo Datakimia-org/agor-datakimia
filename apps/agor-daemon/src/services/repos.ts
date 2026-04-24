@@ -9,6 +9,7 @@
  * the daemon handles database records and business logic.
  */
 
+import { mkdir } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import path from 'node:path';
 import {
@@ -25,6 +26,7 @@ import { type Database, RepoRepository, WorktreeRepository } from '@agor/core/db
 import { autoAssignWorktreeUniqueId } from '@agor/core/environment/variable-resolver';
 import type { Application } from '@agor/core/feathers';
 import {
+  cloneRepo,
   getDefaultBranch,
   getRemoteUrl,
   getWorktreePath,
@@ -323,6 +325,57 @@ export class ReposService extends DrizzleService<Repo, Partial<Repo>, RepoParams
   }
 
   /**
+   * Ensure repository cache path exists and is a valid git repository.
+   * If missing/invalid and remote_url is available, attempt self-heal by re-cloning.
+   */
+  private async ensureRepoCacheReady(repo: Repo): Promise<void> {
+    if (!repo.local_path) {
+      throw new Error(
+        `Repository cache path is not configured for '${repo.slug}'. ` +
+          `Please update the repository configuration and retry.`
+      );
+    }
+
+    if (await isValidGitRepo(repo.local_path)) {
+      return;
+    }
+
+    if (!repo.remote_url) {
+      throw new Error(
+        `Repository cache is missing or invalid at ${repo.local_path} and cannot be restored automatically ` +
+          `because no remote URL is configured. Please restore the local path manually and retry.`
+      );
+    }
+
+    console.warn(
+      `⚠️  Repository cache missing/invalid at ${repo.local_path}. Attempting self-heal from ${repo.remote_url}`
+    );
+
+    try {
+      await mkdir(path.dirname(repo.local_path), { recursive: true });
+      await cloneRepo({
+        url: repo.remote_url,
+        targetDir: repo.local_path,
+      });
+    } catch (error) {
+      throw new Error(
+        `Repository cache could not be restored at ${repo.local_path}. ` +
+          `Please verify repository access and retry clone. ` +
+          `Details: ${error instanceof Error ? error.message : String(error)}`
+      );
+    }
+
+    if (!(await isValidGitRepo(repo.local_path))) {
+      throw new Error(
+        `Repository cache could not be restored at ${repo.local_path}. ` +
+          `Please delete stale cache data and re-clone the repository.`
+      );
+    }
+
+    console.log(`✅ Repository cache restored for ${repo.slug} at ${repo.local_path}`);
+  }
+
+  /**
    * Custom method: Create worktree
    *
    * Delegates git worktree add to executor process for Unix isolation.
@@ -366,81 +419,68 @@ export class ReposService extends DrizzleService<Repo, Partial<Repo>, RepoParams
       throw new Error(`A worktree named '${data.name}' already exists in this repository`);
     }
 
+    // Ensure repo path is valid before any git pre-flight and before spawning executor.
+    await this.ensureRepoCacheReady(repo);
+
     // Pre-flight checks: validate git state before creating DB record
     // This gives the user immediate feedback instead of a silent fire-and-forget failure
     if (repo.local_path) {
-      try {
-        const git = simpleGit(repo.local_path);
+      const git = simpleGit(repo.local_path);
 
-        // Check 1: Validate sourceBranch exists on remote (if specified)
-        // Skip for tags — tags are validated differently (they don't have origin/ prefix)
-        if (data.sourceBranch && data.createBranch && data.refType !== 'tag') {
-          try {
-            await git.fetch(['origin']);
-            const remoteBranches = await git.branch(['-r']);
-            const remoteRef = `origin/${data.sourceBranch}`;
-            if (!remoteBranches.all.includes(remoteRef)) {
-              // Also check local branches as fallback
-              const localBranches = await git.branch();
-              if (!localBranches.all.includes(data.sourceBranch)) {
-                throw new Error(
-                  `Source branch '${data.sourceBranch}' does not exist on remote or locally. ` +
-                    `Available remote branches can be listed with 'git branch -r'. ` +
-                    `Please specify a valid sourceBranch.`
-                );
-              }
-            }
-          } catch (error) {
-            if (
-              error instanceof Error &&
-              error.message.includes('does not exist on remote or locally')
-            ) {
-              throw error;
-            }
-            // Fetch failed — log warning but continue (executor will retry)
-            console.warn(
-              `⚠️  Pre-flight sourceBranch check failed (continuing anyway):`,
-              error instanceof Error ? error.message : String(error)
-            );
-          }
-        }
-
-        // Check 2: Detect stale or conflicting branches
-        if (data.createBranch) {
-          const branches = await git.branch();
-          const branchName = data.ref || data.name;
-
-          if (branches.all.includes(branchName)) {
-            // Branch exists — check if it's in use by another worktree
-            const gitWorktrees = await listWorktrees(repo.local_path);
-            const branchInUse = gitWorktrees.some((wt: { ref?: string }) => wt.ref === branchName);
-
-            if (branchInUse) {
+      // Check 1: Validate sourceBranch exists on remote (if specified)
+      // Skip for tags — tags are validated differently (they don't have origin/ prefix)
+      if (data.sourceBranch && data.createBranch && data.refType !== 'tag') {
+        try {
+          await git.fetch(['origin']);
+          const remoteBranches = await git.branch(['-r']);
+          const remoteRef = `origin/${data.sourceBranch}`;
+          if (!remoteBranches.all.includes(remoteRef)) {
+            // Also check local branches as fallback
+            const localBranches = await git.branch();
+            if (!localBranches.all.includes(data.sourceBranch)) {
               throw new Error(
-                `A branch named '${branchName}' already exists and is in use by another worktree. Please choose a different name.`
+                `Source branch '${data.sourceBranch}' does not exist on remote or locally. ` +
+                  `Available remote branches can be listed with 'git branch -r'. ` +
+                  `Please specify a valid sourceBranch.`
               );
             }
+          }
+        } catch (error) {
+          if (
+            error instanceof Error &&
+            error.message.includes('does not exist on remote or locally')
+          ) {
+            throw error;
+          }
+          // Fetch failed — log warning but continue (executor will retry)
+          console.warn(
+            `⚠️  Pre-flight sourceBranch check failed (continuing anyway):`,
+            error instanceof Error ? error.message : String(error)
+          );
+        }
+      }
 
-            // Branch exists but is orphaned — the executor will clean it up automatically
-            console.log(
-              `⚠️  Branch '${branchName}' exists but is orphaned (stale). Executor will clean it up.`
+      // Check 2: Detect stale or conflicting branches
+      if (data.createBranch) {
+        const branches = await git.branch();
+        const branchName = data.ref || data.name;
+
+        if (branches.all.includes(branchName)) {
+          // Branch exists — check if it's in use by another worktree
+          const gitWorktrees = await listWorktrees(repo.local_path);
+          const branchInUse = gitWorktrees.some((wt: { ref?: string }) => wt.ref === branchName);
+
+          if (branchInUse) {
+            throw new Error(
+              `A branch named '${branchName}' already exists and is in use by another worktree. Please choose a different name.`
             );
           }
+
+          // Branch exists but is orphaned — the executor will clean it up automatically
+          console.log(
+            `⚠️  Branch '${branchName}' exists but is orphaned (stale). Executor will clean it up.`
+          );
         }
-      } catch (error) {
-        // Re-throw user-facing errors
-        if (
-          error instanceof Error &&
-          (error.message.includes('already exists and is in use') ||
-            error.message.includes('does not exist on remote or locally'))
-        ) {
-          throw error;
-        }
-        // Log but don't block creation for other git errors (e.g., repo not accessible)
-        console.warn(
-          `⚠️  Pre-flight branch check failed (continuing anyway):`,
-          error instanceof Error ? error.message : String(error)
-        );
       }
     }
 
