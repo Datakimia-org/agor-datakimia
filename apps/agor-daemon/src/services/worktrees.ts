@@ -336,6 +336,13 @@ export class WorktreesService extends DrizzleService<Worktree, Partial<Worktree>
             {
               logPrefix: `[WorktreesService.remove ${worktree.name}]`,
               asUser, // Run as resolved user (fresh groups via sudo -u)
+              onExit: (code) => {
+                if (code !== 0 && code !== null) {
+                  console.error(
+                    `❌ Filesystem deletion failed for worktree ${worktree.worktree_id} at ${worktree.path} (exit code ${code})`
+                  );
+                }
+              },
             }
           );
         })
@@ -449,6 +456,45 @@ export class WorktreesService extends DrizzleService<Worktree, Partial<Worktree>
             {
               logPrefix: `[WorktreesService.delete ${worktree.name}]`,
               asUser, // Run as resolved user (fresh groups via sudo -u)
+              onExit: (code) => {
+                if (code === 0 && metadataAction === 'archive') {
+                  this.patch(
+                    id,
+                    {
+                      filesystem_status: 'deleted',
+                      updated_at: new Date().toISOString(),
+                    },
+                    { provider: undefined }
+                  ).catch((patchError) => {
+                    console.error(
+                      `⚠️  Failed to mark archived worktree ${worktree.worktree_id} as deleted:`,
+                      patchError instanceof Error ? patchError.message : String(patchError)
+                    );
+                  });
+                  return;
+                }
+
+                if (code !== 0 && code !== null) {
+                  console.error(
+                    `❌ Filesystem delete failed for worktree ${worktree.worktree_id} at ${worktree.path} (exit code ${code})`
+                  );
+                  if (metadataAction === 'archive') {
+                    this.patch(
+                      id,
+                      {
+                        filesystem_status: 'failed',
+                        updated_at: new Date().toISOString(),
+                      },
+                      { provider: undefined }
+                    ).catch((patchError) => {
+                      console.error(
+                        `⚠️  Failed to persist filesystem failure state for worktree ${worktree.worktree_id}:`,
+                        patchError instanceof Error ? patchError.message : String(patchError)
+                      );
+                    });
+                  }
+                }
+              },
             }
           );
         })
@@ -457,6 +503,21 @@ export class WorktreesService extends DrizzleService<Worktree, Partial<Worktree>
             `⚠️  Failed to generate session token for worktree deletion:`,
             error instanceof Error ? error.message : String(error)
           );
+          if (metadataAction === 'archive') {
+            this.patch(
+              id,
+              {
+                filesystem_status: 'failed',
+                updated_at: new Date().toISOString(),
+              },
+              { provider: undefined }
+            ).catch((patchError) => {
+              console.error(
+                `⚠️  Failed to persist token-generation delete failure state for worktree ${worktree.worktree_id}:`,
+                patchError instanceof Error ? patchError.message : String(patchError)
+              );
+            });
+          }
         });
     }
 
@@ -472,7 +533,7 @@ export class WorktreesService extends DrizzleService<Worktree, Partial<Worktree>
           archived: true,
           archived_at: new Date().toISOString(),
           archived_by: currentUserId,
-          filesystem_status: filesystemAction,
+          filesystem_status: filesystemAction === 'deleted' ? 'preserved' : filesystemAction,
           board_id: undefined, // Remove from board
           updated_at: new Date().toISOString(),
         },

@@ -23,6 +23,7 @@ import {
   createWorktree,
   deleteBranch,
   getReposDir,
+  pruneWorktrees,
   removeWorktree,
 } from '@agor/core/git';
 import type {
@@ -551,6 +552,10 @@ export async function handleGitWorktreeAdd(
     let userMessage = errorMessage;
     if (errorMessage.includes('already exists') && errorMessage.includes('branch')) {
       userMessage = `A branch named '${payload.params.branch || payload.params.worktreeName}' already exists and is in use by another worktree. Please choose a different name.`;
+    } else if (errorMessage.includes('Cannot use simple-git on a directory that does not exist')) {
+      userMessage =
+        `Repository cache is missing at '${payload.params.repoPath}'. ` +
+        `Please restore or re-clone the repository cache, then retry worktree creation.`;
     }
 
     return {
@@ -559,6 +564,9 @@ export async function handleGitWorktreeAdd(
         code: 'GIT_WORKTREE_ADD_FAILED',
         message: userMessage,
         details: {
+          recoverable: errorMessage.includes(
+            'Cannot use simple-git on a directory that does not exist'
+          ),
           worktreeId,
           repoId: payload.params.repoId,
           repoPath: payload.params.repoPath,
@@ -654,6 +662,17 @@ export async function handleGitWorktreeRemove(
 
       console.log(`[git.worktree.remove] Worktree removed from filesystem`);
 
+      // Clear stale metadata entries left behind by removed/missing worktrees
+      try {
+        await pruneWorktrees(repoPath);
+        console.log('[git.worktree.remove] Pruned stale worktree metadata');
+      } catch (pruneError) {
+        console.warn(
+          '[git.worktree.remove] Failed to prune worktree metadata:',
+          pruneError instanceof Error ? pruneError.message : String(pruneError)
+        );
+      }
+
       // Delete the associated branch if requested
       if (payload.params.deleteBranch && payload.params.branch) {
         const branchToDelete = payload.params.branch;
@@ -668,11 +687,30 @@ export async function handleGitWorktreeRemove(
             );
           }
         } catch (branchError) {
-          // Log but don't fail the overall operation
+          // Prune and retry once before giving up.
           console.warn(
-            `[git.worktree.remove] Failed to delete branch '${branchToDelete}':`,
+            `[git.worktree.remove] Failed to delete branch '${branchToDelete}', retrying after prune:`,
             branchError instanceof Error ? branchError.message : String(branchError)
           );
+          try {
+            await pruneWorktrees(repoPath);
+            const deletedOnRetry = await deleteBranch(repoPath, branchToDelete);
+            if (deletedOnRetry) {
+              console.log(
+                `[git.worktree.remove] Branch '${branchToDelete}' deleted on retry after prune`
+              );
+            } else {
+              console.log(
+                `[git.worktree.remove] Branch '${branchToDelete}' not found on retry (already deleted)`
+              );
+            }
+          } catch (retryError) {
+            // Log but don't fail the overall operation
+            console.warn(
+              `[git.worktree.remove] Failed to delete branch '${branchToDelete}' after retry:`,
+              retryError instanceof Error ? retryError.message : String(retryError)
+            );
+          }
         }
       }
     } else {
