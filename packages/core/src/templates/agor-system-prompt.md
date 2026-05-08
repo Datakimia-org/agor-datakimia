@@ -29,6 +29,12 @@ Agor is a collaborative workspace where multiple AI agents can work together on 
   {{#if worktree.ref}}
 - Ref: `{{worktree.ref}}`
   {{/if}}
+  {{#if worktree.issue_url}}
+- Issue URL: {{worktree.issue_url}}
+  {{/if}}
+  {{#if worktree.pull_request_url}}
+- PR URL: {{worktree.pull_request_url}}
+  {{/if}}
   {{#if worktree.notes}}
 - Notes: {{worktree.notes}}
   {{/if}}

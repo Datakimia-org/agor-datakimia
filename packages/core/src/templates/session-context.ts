@@ -103,7 +103,10 @@ export async function buildSessionContext(
           name: worktree.name,
           path: worktree.path,
           ref: worktree.ref, // Git ref (branch/tag/commit)
+          issue_url: worktree.issue_url,
+          pull_request_url: worktree.pull_request_url,
           notes: worktree.notes,
+          custom_context: worktree.custom_context,
         };
 
         // Fetch repo data if worktree has one
