@@ -17,6 +17,9 @@ const createdClients: Array<{ baseUrl: string; directory?: string }> = [];
 
 // Mock MCP add calls per client
 const mockMcpAddCalls: Array<{ name: string; config: unknown }> = [];
+const mockMcpConnectCalls: Array<{ name: string; directory?: string }> = [];
+const callOrder: string[] = [];
+const mockMcpConnectResultByName = new Map<string, unknown>();
 
 // Create a mock client factory
 function createMockClient(opts: { baseUrl: string; directory?: string }) {
@@ -28,7 +31,10 @@ function createMockClient(opts: { baseUrl: string; directory?: string }) {
       list: vi.fn().mockResolvedValue({ data: [] }),
       create: vi.fn().mockResolvedValue({ data: { id: 'mock-session-id' } }),
       get: vi.fn().mockResolvedValue({ data: {} }),
-      prompt: vi.fn().mockResolvedValue({ data: { parts: [], info: {} } }),
+      prompt: vi.fn().mockImplementation(async () => {
+        callOrder.push('session.prompt');
+        return { data: { parts: [], info: {} } };
+      }),
       messages: vi.fn().mockResolvedValue({ data: [] }),
     },
     event: {
@@ -38,9 +44,18 @@ function createMockClient(opts: { baseUrl: string; directory?: string }) {
       add: vi
         .fn()
         .mockImplementation(async (params: { body: { name: string; config: unknown } }) => {
+          callOrder.push(`mcp.add:${params.body.name}`);
           mockMcpAddCalls.push({ name: params.body.name, config: params.body.config });
           return { data: {} };
         }),
+      connect: vi.fn().mockImplementation(async (params: { name: string; directory?: string }) => {
+        callOrder.push(`mcp.connect:${params.name}`);
+        mockMcpConnectCalls.push({ name: params.name, directory: params.directory });
+        if (mockMcpConnectResultByName.has(params.name)) {
+          return mockMcpConnectResultByName.get(params.name);
+        }
+        return { data: { session: { clientSessionId: `${params.name}-session-id` } } };
+      }),
     },
   };
 }
@@ -79,6 +94,9 @@ describe('OpenCodeTool', () => {
     clientCreateCount = 0;
     createdClients.length = 0;
     mockMcpAddCalls.length = 0;
+    mockMcpConnectCalls.length = 0;
+    callOrder.length = 0;
+    mockMcpConnectResultByName.clear();
     vi.clearAllMocks();
   });
 
@@ -457,6 +475,324 @@ describe('OpenCodeTool', () => {
       expect(call).toBeDefined();
     });
 
+    it('should eagerly connect datakimia_portal_mcp after injection', async () => {
+      const { getMcpServersForSession } = await import('../base/mcp-scoping.js');
+      const mockGetMcp = vi.mocked(getMcpServersForSession);
+      mockGetMcp.mockResolvedValueOnce([
+        {
+          server: {
+            mcp_server_id: 'server-1',
+            name: 'datakimia portal mcp',
+            transport: 'http',
+            url: 'https://e2e-testing.datakimia.digital/mcp',
+            scope: 'session',
+            enabled: true,
+          } as any,
+          source: 'session-assigned',
+        },
+      ]);
+
+      const tool = new OpenCodeTool(
+        { enabled: true, serverUrl: 'http://localhost:4096' },
+        mockMessagesService,
+        mockSessionMCPRepo,
+        mockMCPServerRepo
+      );
+
+      const client = (tool as any).getClientForDirectory('/worktree/path');
+      await (tool as any).ensureMcpServers('session-1', client, undefined, '/worktree/path');
+
+      expect(mockMcpAddCalls.find((c) => c.name === 'datakimia_portal_mcp')).toBeDefined();
+      expect(mockMcpConnectCalls.find((c) => c.name === 'datakimia_portal_mcp')).toBeDefined();
+      expect(callOrder.indexOf('mcp.connect:datakimia_portal_mcp')).toBeGreaterThan(
+        callOrder.indexOf('mcp.add:datakimia_portal_mcp')
+      );
+    });
+
+    it('should parse clientSessionId from result.session response shape', async () => {
+      const { getMcpServersForSession } = await import('../base/mcp-scoping.js');
+      const mockGetMcp = vi.mocked(getMcpServersForSession);
+      mockGetMcp.mockResolvedValueOnce([
+        {
+          server: {
+            mcp_server_id: 'server-1a',
+            name: 'datakimia_portal_mcp',
+            transport: 'http',
+            url: 'https://e2e-testing.datakimia.digital/mcp',
+            scope: 'session',
+            enabled: true,
+          } as any,
+          source: 'session-assigned',
+        },
+      ]);
+      mockMcpConnectResultByName.set('datakimia_portal_mcp', {
+        result: { session: { clientSessionId: 'result-session-id' } },
+      });
+
+      const tool = new OpenCodeTool(
+        { enabled: true, serverUrl: 'http://localhost:4096' },
+        mockMessagesService,
+        mockSessionMCPRepo,
+        mockMCPServerRepo
+      );
+
+      const client = (tool as any).getClientForDirectory('/worktree/path');
+      await (tool as any).ensureMcpServers(
+        'session-result-shape',
+        client,
+        undefined,
+        '/worktree/path'
+      );
+
+      const key = 'session-result-shape:datakimia_portal_mcp';
+      expect((tool as any).mcpClientSessionIds.get(key)).toBe('result-session-id');
+    });
+
+    it('should parse clientSessionId from data.result.session response shape', async () => {
+      const { getMcpServersForSession } = await import('../base/mcp-scoping.js');
+      const mockGetMcp = vi.mocked(getMcpServersForSession);
+      mockGetMcp.mockResolvedValueOnce([
+        {
+          server: {
+            mcp_server_id: 'server-1b1',
+            name: 'datakimia_portal_mcp',
+            transport: 'http',
+            url: 'https://e2e-testing.datakimia.digital/mcp',
+            scope: 'session',
+            enabled: true,
+          } as any,
+          source: 'session-assigned',
+        },
+      ]);
+      mockMcpConnectResultByName.set('datakimia_portal_mcp', {
+        data: { result: { session: { clientSessionId: 'data-result-session-id' } } },
+      });
+
+      const tool = new OpenCodeTool(
+        { enabled: true, serverUrl: 'http://localhost:4096' },
+        mockMessagesService,
+        mockSessionMCPRepo,
+        mockMCPServerRepo
+      );
+
+      const client = (tool as any).getClientForDirectory('/worktree/path');
+      await (tool as any).ensureMcpServers(
+        'session-header-shape',
+        client,
+        undefined,
+        '/worktree/path'
+      );
+
+      const key = 'session-header-shape:datakimia_portal_mcp';
+      expect((tool as any).mcpClientSessionIds.get(key)).toBe('data-result-session-id');
+    });
+
+    it('should parse clientSessionId from data.session response shape', async () => {
+      const { getMcpServersForSession } = await import('../base/mcp-scoping.js');
+      const mockGetMcp = vi.mocked(getMcpServersForSession);
+      mockGetMcp.mockResolvedValueOnce([
+        {
+          server: {
+            mcp_server_id: 'server-1b2',
+            name: 'datakimia_portal_mcp',
+            transport: 'http',
+            url: 'https://e2e-testing.datakimia.digital/mcp',
+            scope: 'session',
+            enabled: true,
+          } as any,
+          source: 'session-assigned',
+        },
+      ]);
+      mockMcpConnectResultByName.set('datakimia_portal_mcp', {
+        data: { session: { clientSessionId: 'data-session-id' } },
+      });
+
+      const tool = new OpenCodeTool(
+        { enabled: true, serverUrl: 'http://localhost:4096' },
+        mockMessagesService,
+        mockSessionMCPRepo,
+        mockMCPServerRepo
+      );
+
+      const client = (tool as any).getClientForDirectory('/worktree/path');
+      await (tool as any).ensureMcpServers(
+        'session-data-shape',
+        client,
+        undefined,
+        '/worktree/path'
+      );
+
+      const key = 'session-data-shape:datakimia_portal_mcp';
+      expect((tool as any).mcpClientSessionIds.get(key)).toBe('data-session-id');
+    });
+
+    it('should parse clientSessionId from wrapped response.body JSON', async () => {
+      const { getMcpServersForSession } = await import('../base/mcp-scoping.js');
+      const mockGetMcp = vi.mocked(getMcpServersForSession);
+      mockGetMcp.mockResolvedValueOnce([
+        {
+          server: {
+            mcp_server_id: 'server-1b3',
+            name: 'datakimia_portal_mcp',
+            transport: 'http',
+            url: 'https://e2e-testing.datakimia.digital/mcp',
+            scope: 'session',
+            enabled: true,
+          } as any,
+          source: 'session-assigned',
+        },
+      ]);
+      mockMcpConnectResultByName.set('datakimia_portal_mcp', {
+        data: { result: { session: { clientSessionId: 'wrapped-data-session-id' } } },
+        request: { method: 'POST' },
+        response: {
+          body: JSON.stringify({
+            result: { session: { clientSessionId: 'wrapped-response-body-session-id' } },
+          }),
+        },
+      });
+
+      const tool = new OpenCodeTool(
+        { enabled: true, serverUrl: 'http://localhost:4096' },
+        mockMessagesService,
+        mockSessionMCPRepo,
+        mockMCPServerRepo
+      );
+
+      const client = (tool as any).getClientForDirectory('/worktree/path');
+      await (tool as any).ensureMcpServers(
+        'session-wrapped-body-shape',
+        client,
+        undefined,
+        '/worktree/path'
+      );
+
+      const key = 'session-wrapped-body-shape:datakimia_portal_mcp';
+      expect((tool as any).mcpClientSessionIds.get(key)).toBe('wrapped-data-session-id');
+    });
+
+    it('should parse clientSessionId from wrapped response.json payload', async () => {
+      const { getMcpServersForSession } = await import('../base/mcp-scoping.js');
+      const mockGetMcp = vi.mocked(getMcpServersForSession);
+      mockGetMcp.mockResolvedValueOnce([
+        {
+          server: {
+            mcp_server_id: 'server-1b4',
+            name: 'datakimia_portal_mcp',
+            transport: 'http',
+            url: 'https://e2e-testing.datakimia.digital/mcp',
+            scope: 'session',
+            enabled: true,
+          } as any,
+          source: 'session-assigned',
+        },
+      ]);
+      mockMcpConnectResultByName.set('datakimia_portal_mcp', {
+        data: {},
+        request: { method: 'POST' },
+        response: {
+          json: async () => ({
+            result: { session: { clientSessionId: 'wrapped-response-json-session-id' } },
+          }),
+        },
+      });
+
+      const tool = new OpenCodeTool(
+        { enabled: true, serverUrl: 'http://localhost:4096' },
+        mockMessagesService,
+        mockSessionMCPRepo,
+        mockMCPServerRepo
+      );
+
+      const client = (tool as any).getClientForDirectory('/worktree/path');
+      await (tool as any).ensureMcpServers(
+        'session-wrapped-json-shape',
+        client,
+        undefined,
+        '/worktree/path'
+      );
+
+      const key = 'session-wrapped-json-shape:datakimia_portal_mcp';
+      expect((tool as any).mcpClientSessionIds.get(key)).toBe('wrapped-response-json-session-id');
+    });
+
+    it('should parse clientSessionId from wrapped response.text payload', async () => {
+      const { getMcpServersForSession } = await import('../base/mcp-scoping.js');
+      const mockGetMcp = vi.mocked(getMcpServersForSession);
+      mockGetMcp.mockResolvedValueOnce([
+        {
+          server: {
+            mcp_server_id: 'server-1b5',
+            name: 'datakimia_portal_mcp',
+            transport: 'http',
+            url: 'https://e2e-testing.datakimia.digital/mcp',
+            scope: 'session',
+            enabled: true,
+          } as any,
+          source: 'session-assigned',
+        },
+      ]);
+      mockMcpConnectResultByName.set('datakimia_portal_mcp', {
+        data: {},
+        request: { method: 'POST' },
+        response: {
+          text: async () =>
+            JSON.stringify({
+              result: { session: { clientSessionId: 'wrapped-response-text-session-id' } },
+            }),
+        },
+      });
+
+      const tool = new OpenCodeTool(
+        { enabled: true, serverUrl: 'http://localhost:4096' },
+        mockMessagesService,
+        mockSessionMCPRepo,
+        mockMCPServerRepo
+      );
+
+      const client = (tool as any).getClientForDirectory('/worktree/path');
+      await (tool as any).ensureMcpServers(
+        'session-wrapped-text-shape',
+        client,
+        undefined,
+        '/worktree/path'
+      );
+
+      const key = 'session-wrapped-text-shape:datakimia_portal_mcp';
+      expect((tool as any).mcpClientSessionIds.get(key)).toBe('wrapped-response-text-session-id');
+    });
+
+    it('should not eagerly connect non-session MCP servers', async () => {
+      const { getMcpServersForSession } = await import('../base/mcp-scoping.js');
+      const mockGetMcp = vi.mocked(getMcpServersForSession);
+      mockGetMcp.mockResolvedValueOnce([
+        {
+          server: {
+            mcp_server_id: 'server-2',
+            name: 'plain remote',
+            transport: 'http',
+            url: 'https://example.com/mcp',
+            scope: 'session',
+            enabled: true,
+          } as any,
+          source: 'session-assigned',
+        },
+      ]);
+
+      const tool = new OpenCodeTool(
+        { enabled: true, serverUrl: 'http://localhost:4096' },
+        mockMessagesService,
+        mockSessionMCPRepo,
+        mockMCPServerRepo
+      );
+
+      const client = (tool as any).getClientForDirectory(undefined);
+      await (tool as any).ensureMcpServers('session-2', client, undefined);
+
+      expect(mockMcpAddCalls.find((c) => c.name === 'plain_remote')).toBeDefined();
+      expect(mockMcpConnectCalls.find((c) => c.name === 'plain_remote')).toBeUndefined();
+    });
+
     it('should handle MCP injection errors gracefully', async () => {
       const tool = new OpenCodeTool(
         { enabled: true, serverUrl: 'http://localhost:4096' },
@@ -573,6 +909,126 @@ describe('OpenCodeTool', () => {
 
       // Should return failed status (errors are caught internally)
       expect(result?.status).toBe('failed');
+    });
+
+    it('should complete eager MCP init before first prompt execution', async () => {
+      const { getMcpServersForSession } = await import('../base/mcp-scoping.js');
+      const mockGetMcp = vi.mocked(getMcpServersForSession);
+      mockGetMcp.mockResolvedValueOnce([
+        {
+          server: {
+            mcp_server_id: 'server-3',
+            name: 'datakimia_portal_mcp',
+            transport: 'http',
+            url: 'https://e2e-testing.datakimia.digital/mcp',
+            scope: 'session',
+            enabled: true,
+          } as any,
+          source: 'session-assigned',
+        },
+      ]);
+
+      const tool = new OpenCodeTool(
+        { enabled: true, serverUrl: 'http://localhost:4096' },
+        mockMessagesService,
+        mockSessionMCPRepo,
+        mockMCPServerRepo
+      );
+      tool.setSessionContext('session-eager', 'oc-session-3', undefined, undefined, '/worktree');
+
+      await tool.executeTask?.('session-eager', 'test prompt', 'task-eager');
+
+      const connectIdx = callOrder.indexOf('mcp.connect:datakimia_portal_mcp');
+      const promptIdx = callOrder.indexOf('session.prompt');
+      expect(connectIdx).toBeGreaterThan(-1);
+      expect(promptIdx).toBeGreaterThan(-1);
+      expect(connectIdx).toBeLessThan(promptIdx);
+    });
+
+    it('should proceed on wrapped connect shape with data.result.session clientSessionId', async () => {
+      const { getMcpServersForSession } = await import('../base/mcp-scoping.js');
+      const mockGetMcp = vi.mocked(getMcpServersForSession);
+      mockGetMcp.mockResolvedValueOnce([
+        {
+          server: {
+            mcp_server_id: 'server-3b',
+            name: 'datakimia_portal_mcp',
+            transport: 'http',
+            url: 'https://e2e-testing.datakimia.digital/mcp',
+            scope: 'session',
+            enabled: true,
+          } as any,
+          source: 'session-assigned',
+        },
+      ]);
+      mockMcpConnectResultByName.set('datakimia_portal_mcp', {
+        data: { result: { session: { clientSessionId: 'wrapped-real-session-id' } } },
+        request: { method: 'POST' },
+        response: { status: 200 },
+      });
+
+      const tool = new OpenCodeTool(
+        { enabled: true, serverUrl: 'http://localhost:4096' },
+        mockMessagesService,
+        mockSessionMCPRepo,
+        mockMCPServerRepo
+      );
+      tool.setSessionContext(
+        'session-wrapped-pass',
+        'oc-session-3b',
+        undefined,
+        undefined,
+        '/worktree'
+      );
+
+      const result = await tool.executeTask?.(
+        'session-wrapped-pass',
+        'test prompt',
+        'task-wrapped-pass'
+      );
+      expect(result?.status).toBe('completed');
+      expect(callOrder.includes('session.prompt')).toBe(true);
+    });
+
+    it('should continue prompt when datakimia eager init has no clientSessionId', async () => {
+      const { getMcpServersForSession } = await import('../base/mcp-scoping.js');
+      const mockGetMcp = vi.mocked(getMcpServersForSession);
+      mockGetMcp.mockResolvedValueOnce([
+        {
+          server: {
+            mcp_server_id: 'server-4',
+            name: 'datakimia_portal_mcp',
+            transport: 'http',
+            url: 'https://e2e-testing.datakimia.digital/mcp',
+            scope: 'session',
+            enabled: true,
+          } as any,
+          source: 'session-assigned',
+        },
+      ]);
+      mockMcpConnectResultByName.set('datakimia_portal_mcp', { data: { status: 'ok' } });
+
+      const tool = new OpenCodeTool(
+        { enabled: true, serverUrl: 'http://localhost:4096' },
+        mockMessagesService,
+        mockSessionMCPRepo,
+        mockMCPServerRepo
+      );
+      tool.setSessionContext(
+        'session-missing-csid',
+        'oc-session-4',
+        undefined,
+        undefined,
+        '/worktree'
+      );
+
+      const result = await tool.executeTask?.(
+        'session-missing-csid',
+        'test prompt',
+        'task-missing-csid'
+      );
+      expect(result?.status).toBe('completed');
+      expect(callOrder.includes('session.prompt')).toBe(true);
     });
   });
 

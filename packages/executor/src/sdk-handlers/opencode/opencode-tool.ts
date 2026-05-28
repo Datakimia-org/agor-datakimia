@@ -55,6 +55,11 @@ interface SessionContext {
   mcpToken?: string;
 }
 
+type ClientSessionIdExtraction = {
+  clientSessionId?: string;
+  matchedPath: string;
+};
+
 /**
  * Service interface for creating messages via FeathersJS
  */
@@ -82,6 +87,12 @@ export class OpenCodeTool implements ITool {
   private sessionContexts: Map<string, SessionContext> = new Map(); // Agor session ID → session context
   /** Tracks which sessions have had MCP servers injected (hash-based) */
   private injectedMcpHash: Map<string, string> = new Map();
+  /** Tracks eager MCP initialization per agor session + mcp server name */
+  private eagerMcpInit: Set<string> = new Set();
+  /** Stores clientSessionId by agor session + mcp server name */
+  private mcpClientSessionIds: Map<string, string> = new Map();
+  /** Servers that must have clientSessionId for each session */
+  private sessionAwareServersBySession: Map<string, Set<string>> = new Map();
   /** MCP repository dependencies for resolving user-defined MCP servers */
   private sessionMCPRepo?: SessionMCPServerRepository;
   private mcpServerRepo?: MCPServerRepository;
@@ -101,6 +112,231 @@ export class OpenCodeTool implements ITool {
     }
 
     return (response as { data?: T }).data;
+  }
+
+  private shouldForceSessionAwareMcp(serverName: string): boolean {
+    const normalized = serverName.toLowerCase().replace(/[^a-z0-9]+/g, '_');
+    const configured = (process.env.AGOR_FORCE_SESSION_AWARE_MCP_SERVERS || 'datakimia_portal_mcp')
+      .split(',')
+      .map((entry) =>
+        entry
+          .toLowerCase()
+          .replace(/[^a-z0-9]+/g, '_')
+          .trim()
+      )
+      .filter((entry) => entry.length > 0);
+    return configured.includes(normalized);
+  }
+
+  private getMcpInitKey(sessionId: string, mcpName: string): string {
+    return `${sessionId}:${mcpName}`;
+  }
+
+  private summarizeResponseShape(payload: unknown): string {
+    if (!payload || typeof payload !== 'object') return typeof payload;
+    const root = payload as Record<string, unknown>;
+    const topKeys = Object.keys(root).slice(0, 8);
+    const result =
+      root.result && typeof root.result === 'object'
+        ? (root.result as Record<string, unknown>)
+        : undefined;
+    const data =
+      root.data && typeof root.data === 'object'
+        ? (root.data as Record<string, unknown>)
+        : undefined;
+    return JSON.stringify({
+      keys: topKeys,
+      hasResult: !!result,
+      hasData: !!data,
+      resultKeys: result ? Object.keys(result).slice(0, 6) : [],
+      dataKeys: data ? Object.keys(data).slice(0, 6) : [],
+      hasResultSession: !!result?.session,
+      hasDataSession: !!data?.session,
+    });
+  }
+
+  private async extractClientSessionId(payload: unknown): Promise<ClientSessionIdExtraction> {
+    const root =
+      payload && typeof payload === 'object' ? (payload as Record<string, unknown>) : undefined;
+    if (!root) return { matchedPath: '<none>' };
+
+    const asRecord = (value: unknown): Record<string, unknown> | undefined =>
+      value && typeof value === 'object' ? (value as Record<string, unknown>) : undefined;
+
+    const getString = (value: unknown): string | undefined =>
+      typeof value === 'string' && value.trim().length > 0 ? value : undefined;
+
+    const fromResultSession = getString(asRecord(asRecord(root.result)?.session)?.clientSessionId);
+    if (fromResultSession) {
+      return {
+        clientSessionId: fromResultSession,
+        matchedPath: 'resp.result.session.clientSessionId',
+      };
+    }
+
+    const fromDataResultSession = getString(
+      asRecord(asRecord(asRecord(root.data)?.result)?.session)?.clientSessionId
+    );
+    if (fromDataResultSession) {
+      return {
+        clientSessionId: fromDataResultSession,
+        matchedPath: 'resp.data.result.session.clientSessionId',
+      };
+    }
+
+    const fromDataSession = getString(asRecord(asRecord(root.data)?.session)?.clientSessionId);
+    if (fromDataSession) {
+      return {
+        clientSessionId: fromDataSession,
+        matchedPath: 'resp.data.session.clientSessionId',
+      };
+    }
+
+    const responseRecord = asRecord(root.response);
+    if (responseRecord) {
+      const parseResponsePayload = (value: unknown): Record<string, unknown> | undefined => {
+        if (!value) return undefined;
+        if (typeof value === 'string') {
+          try {
+            const parsed = JSON.parse(value);
+            return asRecord(parsed);
+          } catch {
+            return undefined;
+          }
+        }
+        return asRecord(value);
+      };
+
+      const responseBody = parseResponsePayload(responseRecord.body);
+      const fromResponseBody = getString(
+        asRecord(asRecord(responseBody?.result)?.session)?.clientSessionId
+      );
+      if (fromResponseBody) {
+        return {
+          clientSessionId: fromResponseBody,
+          matchedPath: 'resp.response.body->parsed.result.session.clientSessionId',
+        };
+      }
+
+      const responseJson = parseResponsePayload(responseRecord.json);
+      const fromResponseJson = getString(
+        asRecord(asRecord(responseJson?.result)?.session)?.clientSessionId
+      );
+      if (fromResponseJson) {
+        return {
+          clientSessionId: fromResponseJson,
+          matchedPath: 'resp.response.json->parsed.result.session.clientSessionId',
+        };
+      }
+
+      const responseJsonFn = responseRecord.json;
+      if (typeof responseJsonFn === 'function') {
+        try {
+          const parsedFromJsonFn = parseResponsePayload(await responseJsonFn.call(responseRecord));
+          const fromResponseJsonFn = getString(
+            asRecord(asRecord(parsedFromJsonFn?.result)?.session)?.clientSessionId
+          );
+          if (fromResponseJsonFn) {
+            return {
+              clientSessionId: fromResponseJsonFn,
+              matchedPath: 'resp.response.json()->parsed.result.session.clientSessionId',
+            };
+          }
+        } catch {
+          // Keep strict blocking behavior if extraction still fails.
+        }
+      }
+
+      const responseTextFn = responseRecord.text;
+      if (typeof responseTextFn === 'function') {
+        try {
+          const parsedFromTextFn = parseResponsePayload(await responseTextFn.call(responseRecord));
+          const fromResponseTextFn = getString(
+            asRecord(asRecord(parsedFromTextFn?.result)?.session)?.clientSessionId
+          );
+          if (fromResponseTextFn) {
+            return {
+              clientSessionId: fromResponseTextFn,
+              matchedPath: 'resp.response.text()->parsed.result.session.clientSessionId',
+            };
+          }
+        } catch {
+          // Keep strict blocking behavior if extraction still fails.
+        }
+      }
+    }
+
+    return { matchedPath: '<none>' };
+  }
+
+  private async eagerInitializeMcpServer(
+    sessionId: string,
+    client: ReturnType<typeof createOpencodeClient>,
+    mcpName: string,
+    worktreePath?: string
+  ): Promise<void> {
+    const key = this.getMcpInitKey(sessionId, mcpName);
+    if (this.eagerMcpInit.has(key)) return;
+
+    try {
+      const connectResult = await (
+        client.mcp as unknown as {
+          connect: (params: { name: string; directory?: string }) => Promise<unknown>;
+        }
+      ).connect({
+        name: mcpName,
+        directory: worktreePath,
+      });
+      const extraction = await this.extractClientSessionId(connectResult);
+      const clientSessionId = extraction.clientSessionId;
+      if (clientSessionId) {
+        this.mcpClientSessionIds.set(key, clientSessionId);
+        this.eagerMcpInit.add(key);
+        console.log(
+          `[OpenCodeTool][MCP] initialize complete server=${mcpName} session=${clientSessionId.slice(0, 8)} source=${extraction.matchedPath}`
+        );
+        return;
+      }
+      console.warn(
+        `[OpenCodeTool][MCP] initialize returned no clientSessionId server=${mcpName} source=${extraction.matchedPath} shape=${this.summarizeResponseShape(connectResult)}`
+      );
+    } catch (error) {
+      console.warn(`[OpenCodeTool][MCP] eager initialize failed for "${mcpName}":`, error);
+    }
+  }
+
+  private markSessionAwareServer(sessionId: string, mcpName: string): void {
+    const current = this.sessionAwareServersBySession.get(sessionId) || new Set<string>();
+    current.add(mcpName);
+    this.sessionAwareServersBySession.set(sessionId, current);
+  }
+
+  private async ensureSessionAwareMcpReady(
+    sessionId: string,
+    client: ReturnType<typeof createOpencodeClient>,
+    worktreePath?: string
+  ): Promise<void> {
+    const required = this.sessionAwareServersBySession.get(sessionId);
+    if (!required || required.size === 0) return;
+    for (const mcpName of required) {
+      const key = this.getMcpInitKey(sessionId, mcpName);
+      if (!this.mcpClientSessionIds.get(key)) {
+        await this.eagerInitializeMcpServer(sessionId, client, mcpName, worktreePath);
+      }
+      if (!this.mcpClientSessionIds.get(key)) {
+        // Temporary operational fallback: do not hard-block datakimia_portal_mcp prompts
+        // when eager initialize returns wrapper shapes we cannot parse yet.
+        if (this.shouldForceSessionAwareMcp(mcpName)) {
+          console.warn(
+            `[OpenCodeTool][MCP] eager initialize missing clientSessionId server=${mcpName}; continuing prompt and relying on runtime tools/call session injection`
+          );
+          continue;
+        }
+        throw new Error(
+          `MCP server "${mcpName}" did not provide clientSessionId during eager initialize; blocking prompt to avoid tools/call race`
+        );
+      }
+    }
   }
 
   constructor(
@@ -228,6 +464,10 @@ export class OpenCodeTool implements ITool {
           `[OpenCodeTool] Injected Agor MCP as "${mcpName}" for session ${shortId}`,
           mcpResult.data ? `status: ${JSON.stringify(mcpResult.data)}` : ''
         );
+        if (this.shouldForceSessionAwareMcp(mcpName)) {
+          this.markSessionAwareServer(sessionId, mcpName);
+          await this.eagerInitializeMcpServer(sessionId, client, mcpName, worktreePath);
+        }
       } catch (error) {
         console.warn(`[OpenCodeTool] Failed to inject Agor MCP server "${mcpName}":`, error);
       }
@@ -280,6 +520,10 @@ export class OpenCodeTool implements ITool {
                 },
                 query: worktreePath ? { directory: worktreePath } : undefined,
               });
+              if (this.shouldForceSessionAwareMcp(sanitizedName)) {
+                this.markSessionAwareServer(sessionId, sanitizedName);
+                await this.eagerInitializeMcpServer(sessionId, client, sanitizedName, worktreePath);
+              }
             }
             console.log(`[OpenCodeTool] Injected MCP server: ${sanitizedName}`);
           } catch (error) {
@@ -420,6 +664,18 @@ export class OpenCodeTool implements ITool {
 
       // Inject MCP servers (uses session-specific name to avoid stale entry conflicts)
       await this.ensureMcpServers(sessionId, client, context.mcpToken, worktreePath);
+      await this.ensureSessionAwareMcpReady(sessionId, client, worktreePath);
+      const sessionScopedMcpIds = Array.from(this.mcpClientSessionIds.entries()).filter(([key]) =>
+        key.startsWith(`${sessionId}:`)
+      );
+      if (sessionScopedMcpIds.length > 0) {
+        for (const [key, clientSessionId] of sessionScopedMcpIds) {
+          const serverName = key.split(':').slice(1).join(':');
+          console.log(
+            `[OpenCodeTool][MCP] first tools/call guard server=${serverName} clientSessionId=yes session=${clientSessionId.slice(0, 8)}`
+          );
+        }
+      }
 
       // Prepare prompt options
       const promptOptions: {

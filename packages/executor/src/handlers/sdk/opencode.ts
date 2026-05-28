@@ -18,6 +18,35 @@ import { OpenCodeTool } from '../../sdk-handlers/opencode/index.js';
 import type { AgorClient } from '../../services/feathers-client.js';
 import { createStreamingCallbacks } from './base-executor.js';
 
+const DEFAULT_OPENCODE_PROVIDER = 'google';
+const DEFAULT_OPENCODE_MODEL = 'gemini-2.5-pro';
+const OBSOLETE_OPENCODE_GEMINI_MODELS = new Set([
+  'gemini-3-pro-preview',
+  'models/gemini-3-pro-preview',
+  'gemini-2.0-flash',
+  'models/gemini-2.0-flash',
+]);
+
+function resolveOpenCodeModelConfig(sessionModel?: string, sessionProvider?: string) {
+  const normalizedModel = sessionModel?.replace(/^models\//, '');
+
+  if (
+    !normalizedModel ||
+    OBSOLETE_OPENCODE_GEMINI_MODELS.has(sessionModel ?? '') ||
+    OBSOLETE_OPENCODE_GEMINI_MODELS.has(normalizedModel)
+  ) {
+    return {
+      model: DEFAULT_OPENCODE_MODEL,
+      provider: DEFAULT_OPENCODE_PROVIDER,
+    };
+  }
+
+  return {
+    model: normalizedModel,
+    provider: sessionProvider ?? DEFAULT_OPENCODE_PROVIDER,
+  };
+}
+
 /**
  * Execute OpenCode task (Feathers/WebSocket architecture)
  *
@@ -44,6 +73,11 @@ export async function executeOpenCodeTask(params: {
       model: session.model_config?.model,
       provider: session.model_config?.provider,
     });
+    const modelConfig = resolveOpenCodeModelConfig(
+      session.model_config?.model,
+      session.model_config?.provider
+    );
+    console.log('[opencode] Resolved model config:', modelConfig);
 
     // Create execution context (similar to other handlers)
     const repos = createFeathersBackedRepositories(client);
@@ -100,8 +134,8 @@ export async function executeOpenCodeTask(params: {
       const sessionHandle = await tool.createSession?.({
         title: session.title || `Task ${taskId.substring(0, 8)}`,
         projectName: 'agor',
-        model: session.model_config?.model,
-        provider: session.model_config?.provider,
+        model: modelConfig.model,
+        provider: modelConfig.provider,
         workingDirectory: worktreePath,
       });
 
@@ -123,8 +157,8 @@ export async function executeOpenCodeTask(params: {
     tool.setSessionContext(
       sessionId,
       opencodeSessionId,
-      session.model_config?.model,
-      session.model_config?.provider,
+      modelConfig.model,
+      modelConfig.provider,
       worktreePath,
       session.mcp_token
     );
@@ -162,9 +196,9 @@ export async function executeOpenCodeTask(params: {
 
     // Construct model identifier in provider/model format (e.g., "openai/gpt-4o")
     const modelIdentifier =
-      session.model_config?.provider && session.model_config?.model
-        ? `${session.model_config.provider}/${session.model_config.model}`
-        : session.model_config?.model;
+      modelConfig.provider && modelConfig.model
+        ? `${modelConfig.provider}/${modelConfig.model}`
+        : modelConfig.model;
 
     console.log('[opencode] Setting task model:', modelIdentifier);
 

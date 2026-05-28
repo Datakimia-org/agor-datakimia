@@ -109,6 +109,7 @@ import type {
 import { SessionStatus, TaskStatus } from '@agor/core/types';
 import { NotFoundError } from '@agor/core/utils/errors';
 
+import { createSessionAwareClientFetch } from './mcp/session-aware-client-fetch.js';
 import { performOAuthDisconnect } from './services/oauth-disconnect.js';
 // Executor spawning utility for fire-and-forget Unix operations
 import {
@@ -2544,44 +2545,63 @@ async function main() {
         // response but doesn't include it in subsequent requests)
         const createMCPConnection = (connHeaders: Record<string, string>) => {
           let sessionId: string | undefined;
+          const normalizeMcpServerName = (name: string | undefined): string =>
+            (name || '').toLowerCase().replace(/[^a-z0-9]+/g, '_');
+          const normalizedServerName = normalizeMcpServerName(serverConfig.name);
+          const forceSessionAwareServerSet = new Set(
+            (process.env.AGOR_FORCE_SESSION_AWARE_MCP_SERVERS || 'datakimia_portal_mcp')
+              .split(',')
+              .map((entry) => normalizeMcpServerName(entry))
+              .filter((entry) => entry.length > 0)
+          );
+          const forceClientSessionIdInjection =
+            forceSessionAwareServerSet.has(normalizedServerName);
 
-          const connSessionAwareFetch: typeof fetch = async (input, init) => {
-            if (sessionId && init?.headers) {
-              const headersObj =
-                init.headers instanceof Headers
-                  ? Object.fromEntries(init.headers.entries())
-                  : (init.headers as Record<string, string>);
+          const connSessionAwareFetch = createSessionAwareClientFetch({
+            serverName: serverConfig.name || 'unknown-mcp',
+            requestInitHeaders: connHeaders,
+            baseFetch: async (input, init) => {
+              if (sessionId && init?.headers) {
+                const headersObj =
+                  init.headers instanceof Headers
+                    ? Object.fromEntries(init.headers.entries())
+                    : (init.headers as Record<string, string>);
 
-              if (!headersObj['mcp-session-id']) {
-                console.log('[MCP Discovery] Injecting session ID into request:', sessionId);
-                init = {
-                  ...init,
-                  headers: {
-                    ...headersObj,
-                    'mcp-session-id': sessionId,
-                  },
-                };
+                if (!headersObj['mcp-session-id']) {
+                  init = {
+                    ...init,
+                    headers: {
+                      ...headersObj,
+                      'mcp-session-id': sessionId,
+                    },
+                  };
+                }
               }
-            }
 
-            const response = await fetch(input, init);
+              const response = await fetch(input, init);
 
-            const respSessionId = response.headers.get('mcp-session-id');
-            if (respSessionId) {
-              sessionId = respSessionId;
-              console.log('[MCP Discovery] Captured session ID:', respSessionId);
-            }
+              const respSessionId = response.headers.get('mcp-session-id');
+              if (respSessionId) {
+                sessionId = respSessionId;
+                console.log('[MCP Discovery] Captured session ID:', respSessionId);
+              }
 
-            console.log(
-              '[MCP Discovery] Response:',
-              response.status,
-              response.statusText,
-              'session-id:',
-              respSessionId || '<none>'
-            );
+              console.log(
+                '[MCP Discovery] Response:',
+                response.status,
+                response.statusText,
+                'session-id:',
+                respSessionId || '<none>'
+              );
 
-            return response;
-          };
+              return response;
+            },
+            getMcpSessionId: () => sessionId,
+            setMcpSessionId: (newSessionId) => {
+              sessionId = newSessionId;
+            },
+            forceClientSessionIdInjection,
+          });
 
           const transport = new StreamableHTTPClientTransport(new URL(serverConfig.url!), {
             fetch: connSessionAwareFetch,
@@ -2593,14 +2613,18 @@ async function main() {
             { capabilities: {} }
           );
 
-          return { transport, client: mcpClient };
+          return { transport, client: mcpClient, connSessionAwareFetch };
         };
 
         // Track whether we used a cached OAuth token (for retry logic)
         const hadCachedOAuthToken = !!(authHeaders && serverConfig.auth?.type === 'oauth');
 
         // Create initial MCP connection
-        let { transport: httpTransport, client } = createMCPConnection(headers);
+        let {
+          transport: httpTransport,
+          client,
+          connSessionAwareFetch,
+        } = createMCPConnection(headers);
         let connected = false;
 
         try {
@@ -2657,6 +2681,7 @@ async function main() {
                 const retry = createMCPConnection(freshHeaders);
                 httpTransport = retry.transport;
                 client = retry.client;
+                connSessionAwareFetch = retry.connSessionAwareFetch;
 
                 // Retry connection with fresh token
                 await connectWithTimeout(client, httpTransport);
@@ -2670,6 +2695,11 @@ async function main() {
 
           connected = true;
           console.log('[MCP Discovery] ✅ Successfully connected!');
+          await connSessionAwareFetch.preInitialize(serverConfig.url!);
+          console.log(
+            '[MCP Discovery] MCP pre-initialize complete, clientSessionId:',
+            connSessionAwareFetch.getClientSessionId()?.slice(0, 8) || '<none>'
+          );
 
           // Debug: Log session ID to verify SDK is managing it correctly
           console.log(
