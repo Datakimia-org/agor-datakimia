@@ -459,7 +459,7 @@ export function registerSessionTools(server: McpServer, ctx: McpContext): void {
             'How to route the work: continue (add to existing session), fork (create sibling session), subsession (create child session)'
           ),
         agenticTool: z
-          .enum(['claude-code', 'codex', 'gemini'])
+          .enum(['claude-code', 'codex', 'gemini', 'opencode'])
           .optional()
           .describe(
             'Agent for subsession (subsession mode only, defaults to parent agent). Fork mode always uses parent agent.'
@@ -575,7 +575,7 @@ export function registerSessionTools(server: McpServer, ctx: McpContext): void {
       inputSchema: z.object({
         worktreeId: z.string().describe('Worktree ID where the session will run (required)'),
         agenticTool: z
-          .enum(['claude-code', 'codex', 'gemini'])
+          .enum(['claude-code', 'codex', 'gemini', 'opencode'])
           .describe('Which agent to use for this session (required)'),
         title: z.string().optional().describe('Session title (optional)'),
         description: z.string().optional().describe('Session description (optional)'),
