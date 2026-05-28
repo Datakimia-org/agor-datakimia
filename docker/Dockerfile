@@ -112,6 +112,10 @@ USER agor
 # ============================================================================
 FROM base AS development
 
+# Bust Docker layer cache on each CI build so COPY . /app picks up latest source (GITHUB_SHA).
+ARG GIT_SHA=unknown
+RUN echo "Agor development image source revision: ${GIT_SHA}"
+
 # Copy package files with ownership so we avoid slow `chown -R /app`
 COPY --chown=agor:agor package.json pnpm-lock.yaml pnpm-workspace.yaml ./
 COPY --chown=agor:agor apps/agor-daemon/package.json ./apps/agor-daemon/

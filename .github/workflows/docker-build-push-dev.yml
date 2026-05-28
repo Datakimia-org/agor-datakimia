@@ -40,7 +40,9 @@ jobs:
       - name: Build and push development Docker image
         run: |
           docker build \
+            --pull \
             --target development \
+            --build-arg GIT_SHA=${{ github.sha }} \
             -t ${{ env.REGISTRY }}/${{ env.PROJECT_ID }}/${{ env.REPOSITORY }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }} \
             -f docker/Dockerfile \
             .
