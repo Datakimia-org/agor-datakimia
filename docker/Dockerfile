@@ -53,10 +53,12 @@ RUN ZELLIJ_VERSION=0.43.1 && \
   zellij --version
 
 # Install GitHub CLI (gh) - download pre-built binary
-RUN curl -fsSL "$(curl -s https://api.github.com/repos/cli/cli/releases/latest | grep 'browser_download_url.*linux_amd64.tar.gz"' | cut -d'"' -f4)" | \
+# Pinned to v2.93.0 for reproducibility (avoid GitHub API rate limits during build)
+RUN GH_VERSION=2.93.0 && \
+  curl -fsSL "https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_linux_amd64.tar.gz" | \
   tar -xz -C /tmp && \
-  mv /tmp/gh_*/bin/gh /usr/local/bin/ && \
-  rm -rf /tmp/gh_*
+  mv /tmp/gh_${GH_VERSION}_linux_amd64/bin/gh /usr/local/bin/ && \
+  rm -rf /tmp/gh_${GH_VERSION}_linux_amd64
 
 # Install pnpm and AI coding agent CLIs
 # Pinned versions for reproducibility across dev and prod
